@@ -27,20 +27,39 @@ extern char trampoline[]; // trampoline.S
 struct spinlock wait_lock;
 
 int wait_noblock(uint64 exit_status) {
-  // the current process, which is the shell
+  struct proc *pp;
+  int pid;
   struct proc *p = myproc();
-  // loop through all processes
-  for(struct proc *pp = proc; pp < &proc[NPROC]; pp++){
-    if(pp->parent == p && pp->state == ZOMBIE){
-      int pid = pp->pid;
-      // Get the child's xstate (exit code) to user space:
-      if(copyout(p->pagetable, exit_status, (char *)&pp->xstate, sizeof(int)) < 0)
-        return -1;
-      // Free the process entry from the proc table
-      freeproc(pp);
-      return pid;
+
+  acquire(&wait_lock);
+
+  // Scan through table looking for exited children.
+  for(pp = proc; pp < &proc[NPROC]; pp++){
+    if(pp->parent == p){
+      // make sure the child isn't still in exit() or swtch().
+      acquire(&pp->lock);
+
+      if(pp->state == ZOMBIE){
+        // Found one.
+        pid = pp->pid;
+        if(exit_status != 0){
+          if(copyout(p->pagetable, exit_status, (char *)&pp->xstate,
+                     sizeof(pp->xstate)) < 0) {
+            release(&pp->lock);
+            release(&wait_lock);
+            return -1;
+          }
+        }
+        freeproc(pp);
+        release(&pp->lock);
+        release(&wait_lock);
+        return pid;
+      }
+      release(&pp->lock);
     }
   }
+
+  release(&wait_lock);
   return 0; // no zombie child
 }
 

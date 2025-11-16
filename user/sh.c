@@ -3,6 +3,7 @@
 #include "kernel/types.h"
 #include "user/user.h"
 #include "kernel/fcntl.h"
+#include "kernel/param.h"
 
 // Parsed command representation
 #define EXEC  1
@@ -54,6 +55,32 @@ void panic(char*);
 struct cmd *parsecmd(char*);
 void runcmd(struct cmd*) __attribute__((noreturn));
 
+// Global array to track background job PIDs
+int jobs[NPROC];
+int njobs = 0;  // Number of background jobs
+
+// Remove a PID from the jobs array
+void remove_job(int pid) {
+  for(int i = 0; i < njobs; i++){
+    if(jobs[i] == pid){
+      // Move all elements after i one position to the left
+      for(int j = i; j < njobs - 1; j++){
+        jobs[j] = jobs[j + 1];
+      }
+      njobs--;
+      break;
+    }
+  }
+}
+
+// Add a PID to the jobs array
+void add_job(int pid) {
+  if(njobs < NPROC){
+    jobs[njobs] = pid;
+    njobs++;
+  }
+}
+
 // Execute cmd.  Never returns.
 void
 runcmd(struct cmd *cmd)
@@ -76,9 +103,17 @@ runcmd(struct cmd *cmd)
     ecmd = (struct execcmd*)cmd;
     if(ecmd->argv[0] == 0)
       exit(1);
-    exec(ecmd->argv[0], ecmd->argv);
+    // If the command doesn't start with '/', prepend '/'
+    char *path = ecmd->argv[0];
+    char fullpath[512];
+    if(path[0] != '/'){
+      fullpath[0] = '/';
+      strcpy(fullpath + 1, path);
+      path = fullpath;
+    }
+    exec(path, ecmd->argv);
     fprintf(2, "exec %s failed\n", ecmd->argv[0]);
-    break;
+    exit(0);  // Exit with status 0 if exec fails (as per test requirements)
 
   case REDIR:
     rcmd = (struct redircmd*)cmd;
@@ -136,7 +171,7 @@ runcmd(struct cmd *cmd)
 int
 getcmd(char *buf, int nbuf)
 {
-  write(2, "$ ", 2);
+  // write(2, "$ ", 2); // <<< 刪除或註解掉這一行
   memset(buf, 0, nbuf);
   gets(buf, nbuf);
   if(buf[0] == 0) // EOF
@@ -144,12 +179,39 @@ getcmd(char *buf, int nbuf)
   return 0;
 }
 
+// Read a line from file descriptor fd into buf
 int
-main(void)
+getline_from_fd(int fd, char *buf, int nbuf)
+{
+  memset(buf, 0, nbuf);
+  int i = 0;
+  char c;
+  while(i < nbuf - 1){
+    if(read(fd, &c, 1) <= 0){
+      if(i == 0)
+        return -1; // EOF
+      break;
+    }
+    if(c == '\n'){
+      buf[i] = '\n';
+      i++;
+      break;
+    }
+    buf[i] = c;
+    i++;
+  }
+  buf[i] = 0;
+  return 0;
+}
+
+int
+main(int argc, char* argv[])
 {
   static char buf[100];
   int fd;
   struct cmd *cmd; // <<< 把 cmd 宣告移到迴圈外
+  int script_fd = -1;  // File descriptor for script file
+  
   // Ensure that three file descriptors are open.
   while((fd = open("console", O_RDWR)) >= 0){
     if(fd >= 3){
@@ -158,8 +220,69 @@ main(void)
     }
   }
 
+  // If script file is provided, open it
+  if(argc > 1){
+    script_fd = open(argv[1], O_RDONLY);
+    if(script_fd < 0){
+      fprintf(2, "sh: cannot open %s\n", argv[1]);
+      exit(1);
+    }
+  }
+
   // Read and run input commands.
-  while(getcmd(buf, sizeof(buf)) >= 0){
+  while(1){
+    // 1. 在印出 $「之前」，回收殭屍
+    int exit_status;
+    int bg_pid;
+    while((bg_pid = wait_noblock(&exit_status)) > 0){
+      printf("[bg %d] exited with status %d\n", bg_pid, exit_status);
+      remove_job(bg_pid);  // Remove from jobs array
+    }
+
+    // 2. 現在由 main 負責印出 $ (only if not reading from script)
+    if(script_fd < 0){
+      write(2, "$ ", 2);
+    }
+
+    // 3. 從腳本文件或標準輸入讀取命令
+    if(script_fd >= 0){
+      // Read from script file
+      if(getline_from_fd(script_fd, buf, sizeof(buf)) < 0){
+        close(script_fd);
+        break; // End of script file
+      }
+    } else {
+      // Read from standard input
+      if(getcmd(buf, sizeof(buf)) < 0){
+        break; // 偵測到 EOF (Ctrl+D)，退出 shell
+      }
+    }
+
+    // Check for completed background processes after reading command
+    // This ensures background process output appears before the next command
+    while((bg_pid = wait_noblock(&exit_status)) > 0){
+      printf("[bg %d] exited with status %d\n", bg_pid, exit_status);
+      remove_job(bg_pid);  // Remove from jobs array
+    }
+
+    // Skip empty lines
+    if(buf[0] == '\n' || buf[0] == '\0'){
+      continue;
+    }
+
+    // Handle jobs command (must be checked before parsecmd)
+    // Check if the command is exactly "jobs" followed by newline, null, space, or carriage return
+    if(buf[0] == 'j' && buf[1] == 'o' && buf[2] == 'b' && buf[3] == 's'){
+      // Check if it's exactly "jobs" with optional trailing whitespace
+      if(buf[4] == '\n' || buf[4] == '\0' || buf[4] == ' ' || buf[4] == '\t' || buf[4] == '\r'){
+        // Print all background job PIDs
+        for(int i = 0; i < njobs; i++){
+          printf("%d\n", jobs[i]);
+        }
+        continue;
+      }
+    }
+
     if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
       // Chdir must be called by the parent, not the child.
       buf[strlen(buf)-1] = 0;  // chop \n
@@ -168,7 +291,7 @@ main(void)
       continue;
     }
 
-    cmd = parsecmd(buf); // <<< 1. 在 fork 之前解析
+    cmd = parsecmd(buf); //1. 在 fork 之前解析
     int pid = fork1();
     if(pid == 0){
       if(cmd->type == BACK){
@@ -183,9 +306,54 @@ main(void)
       // --- 父進程 (Shell) ---
       if(cmd->type == BACK){
         // 5. 只有「不是」背景命令時，才 wait()
+        // Check for completed background processes BEFORE printing new PID
+        // This ensures correct output order
+        while((bg_pid = wait_noblock(&exit_status)) > 0){
+          printf("[bg %d] exited with status %d\n", bg_pid, exit_status);
+          remove_job(bg_pid);  // Remove from jobs array
+        }
         printf("[%d]\n", pid);
+        add_job(pid);  // Add to jobs array
+        // Check for completed background processes after starting a new one
+        // This catches quickly-completing background processes
+        while((bg_pid = wait_noblock(&exit_status)) > 0){
+          printf("[bg %d] exited with status %d\n", bg_pid, exit_status);
+          remove_job(bg_pid);  // Remove from jobs array
+        }
       }else {
-        wait(0);
+        // Wait for foreground process, but check background processes periodically
+        int fg_pid = pid;
+        int wpid;
+        int exit_status;
+        int fg_done = 0;
+        while(!fg_done){
+          // First check for background processes
+          while((bg_pid = wait_noblock(&exit_status)) > 0){
+            if(bg_pid == fg_pid){
+              // Foreground process is done
+              fg_done = 1;
+              break;
+            }
+            printf("[bg %d] exited with status %d\n", bg_pid, exit_status);
+            remove_job(bg_pid);  // Remove from jobs array
+          }
+          if(fg_done){
+            break; // Foreground process completed
+          }
+          // No zombie processes, use blocking wait with status
+          wpid = wait(&exit_status);
+          if(wpid == fg_pid){
+            fg_done = 1;
+            break; // Foreground process completed
+          } else if(wpid > 0){
+            // Some background process completed
+            printf("[bg %d] exited with status %d\n", wpid, exit_status);
+            remove_job(wpid);
+            continue;
+          } else {
+            break; // Error or no children
+          }
+        }
       }
       // 如果是 BACK 命令，父進程什麼都不做，直接印下一個 $
     }
