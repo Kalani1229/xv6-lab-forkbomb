@@ -26,6 +26,24 @@ extern char trampoline[]; // trampoline.S
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
 
+int wait_noblock(uint64 exit_status) {
+  // the current process, which is the shell
+  struct proc *p = myproc();
+  // loop through all processes
+  for(struct proc *pp = proc; pp < &proc[NPROC]; pp++){
+    if(pp->parent == p && pp->state == ZOMBIE){
+      int pid = pp->pid;
+      // Get the child's xstate (exit code) to user space:
+      if(copyout(p->pagetable, exit_status, (char *)&pp->xstate, sizeof(int)) < 0)
+        return -1;
+      // Free the process entry from the proc table
+      freeproc(pp);
+      return pid;
+    }
+  }
+  return 0; // no zombie child
+}
+
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
 // guard page.

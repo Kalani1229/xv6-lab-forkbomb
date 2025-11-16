@@ -124,8 +124,10 @@ runcmd(struct cmd *cmd)
 
   case BACK:
     bcmd = (struct backcmd*)cmd;
-    if(fork1() == 0)
-      runcmd(bcmd->cmd);
+    // 遞迴呼叫 runcmd 來執行 bcmd->cmd
+    // 因為我們在 main 中已經 fork 
+    // 這裡的 runcmd 是在子進程中被呼叫的
+    runcmd(bcmd->cmd);
     break;
   }
   exit(0);
@@ -147,7 +149,7 @@ main(void)
 {
   static char buf[100];
   int fd;
-
+  struct cmd *cmd; // <<< 把 cmd 宣告移到迴圈外
   // Ensure that three file descriptors are open.
   while((fd = open("console", O_RDWR)) >= 0){
     if(fd >= 3){
@@ -165,9 +167,28 @@ main(void)
         fprintf(2, "cannot cd %s\n", buf+3);
       continue;
     }
-    if(fork1() == 0)
-      runcmd(parsecmd(buf));
-    wait(0);
+
+    cmd = parsecmd(buf); // <<< 1. 在 fork 之前解析
+    int pid = fork1();
+    if(pid == 0){
+      if(cmd->type == BACK){
+        // 3. 如果是背景，執行「裡面」的命令
+        struct backcmd *bcmd = (struct backcmd*)cmd;
+        runcmd(bcmd->cmd);
+      } else {
+        // 4. 如果是前景，正常執行
+        runcmd(cmd);
+      }
+    }else if(pid > 0){
+      // --- 父進程 (Shell) ---
+      if(cmd->type == BACK){
+        // 5. 只有「不是」背景命令時，才 wait()
+        printf("[%d]\n", pid);
+      }else {
+        wait(0);
+      }
+      // 如果是 BACK 命令，父進程什麼都不做，直接印下一個 $
+    }
   }
   exit(0);
 }

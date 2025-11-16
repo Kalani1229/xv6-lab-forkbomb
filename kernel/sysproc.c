@@ -7,6 +7,14 @@
 #include "proc.h"
 
 uint64
+sys_wait_noblock(void)
+{
+  uint64 exit_status;
+  argaddr(0, &exit_status);
+  return wait_noblock(exit_status);
+}
+
+uint64
 sys_exit(void)
 {
   int n;
